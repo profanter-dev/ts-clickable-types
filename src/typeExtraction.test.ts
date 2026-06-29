@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractTypeNames, scanForPascalCaseTypes, escapeRegExp, BUILTIN_TYPES, findTypeNameInLines } from './typeExtraction';
+import { extractTypeNames, scanForPascalCaseTypes, escapeRegExp, BUILTIN_TYPES, findTypeNameInLines, selectWorkspaceSymbolMatch } from './typeExtraction';
 
 // Helper to wrap code in a fenced block (mimics TS hover output)
 function fenced(code: string): string {
@@ -190,6 +190,60 @@ describe('extractTypeNames', () => {
 		expect(extractTypeNames(hover)).toEqual([]);
 	});
 
+	// --- Fix #2: SYMBOL_PATTERN must not exclude type references from prose ---
+
+	it('does not exclude a type referenced in code just because prose mentions a declaration with the same keyword', () => {
+		// Hover prose says "type UserProfile = ..." in markdown text, but the
+		// actual code block references UserProfile as a TYPE. The current bug:
+		// SYMBOL_PATTERN scans the entire hoverText and excludes UserProfile.
+		const hover = [
+			'```typescript',
+			'(property) data: UserProfile',
+			'```',
+			'',
+			'You can declare it as: type UserProfile = { name: string }',
+		].join('\n');
+		const result = extractTypeNames(hover);
+		expect(result).toEqual(['UserProfile']);
+	});
+
+	it('does not exclude a type when prose uses interface keyword in narrative', () => {
+		const hover = [
+			'```typescript',
+			'const widget: MyWidget',
+			'```',
+			'',
+			'See interface MyWidget for details.',
+		].join('\n');
+		expect(extractTypeNames(hover)).toEqual(['MyWidget']);
+	});
+
+	// --- Fix #4: expanded BUILTIN_TYPES ---
+
+	it('filters out common React types', () => {
+		const hover = fenced('const C: FC<PropsWithChildren<MyProps>>');
+		expect(extractTypeNames(hover)).toEqual(['MyProps']);
+	});
+
+	it('never extracts all-caps short identifiers regardless of BUILTIN_TYPES membership', () => {
+		// PASCAL_CASE requires at least one lowercase letter, so all-caps names
+		// like FC, JSX, VFC are never produced by the extractor. This test
+		// guards against adding dead exclusion-list entries.
+		const hover = fenced('const x: FC | JSX | VFC | API');
+		expect(extractTypeNames(hover)).toEqual([]);
+	});
+
+	it('filters out ReactNode and ReactElement', () => {
+		const hover = fenced('const x: ReactNode | ReactElement');
+		expect(extractTypeNames(hover)).toEqual([]);
+	});
+
+	it('filters out Node Buffer and NodeJS namespace', () => {
+		const hover = fenced('const x: Buffer | NodeJS.ProcessEnv');
+		// NodeJS is the namespace; ProcessEnv (a member of it) is still a real type — keep it
+		expect(extractTypeNames(hover)).toEqual(['ProcessEnv']);
+	});
+
 	it('handles complex real-world hover text', () => {
 		const hover = [
 			'```typescript',
@@ -283,6 +337,35 @@ describe('findTypeNameInLines', () => {
 		expect(findTypeNameInLines((i) => linesWithType[i], linesWithType.length, 1, 7, 'Config')).toEqual({ line: 0, character: 9 });
 	});
 
+	it('fallback prefers the line closer to the hover line', () => {
+		// Type appears at hoverLine - 4 AND hoverLine + 1. The closer match
+		// (hoverLine + 1) should win, even though the iteration order would
+		// naturally encounter the farther one first.
+		const lines = [
+			'',                  // 0
+			'',                  // 1
+			'const a: MyType',   // 2  ← 4 lines above hover
+			'',                  // 3
+			'',                  // 4
+			'',                  // 5
+			'hover here',        // 6  ← hover line
+			'const b: MyType',   // 7  ← 1 line below hover, CLOSER
+			'',                  // 8
+		];
+		expect(findTypeNameInLines((i) => lines[i], lines.length, 6, 0, 'MyType')).toEqual({ line: 7, character: 9 });
+	});
+
+	it('fallback prefers line above on equidistant tie (above before below at same offset)', () => {
+		const lines = [
+			'',                  // 0
+			'const a: MyType',   // 1  ← 1 line above hover
+			'hover here',        // 2  ← hover line
+			'const b: MyType',   // 3  ← 1 line below hover (SAME distance)
+			'',                  // 4
+		];
+		expect(findTypeNameInLines((i) => lines[i], lines.length, 2, 0, 'MyType')).toEqual({ line: 1, character: 9 });
+	});
+
 	it('does not search beyond searchRange', () => {
 		const lines = [
 			'MyType is here',   // line 0
@@ -311,6 +394,53 @@ describe('findTypeNameInLines', () => {
 		findTypeNameInLines(read, totalLines, hoverLine, 0, 'Foo');
 		expect(calls.every((i) => i >= 4995 && i <= 5005)).toBe(true);
 		expect(calls.length).toBeLessThanOrEqual(11);
+	});
+});
+
+describe('selectWorkspaceSymbolMatch', () => {
+	// Mirrors vscode.SymbolKind values we care about — kept as numbers so the
+	// test doesn't need to import the vscode module.
+	const Class = 4;
+	const Interface = 10;
+	const Variable = 12;
+	const Function = 11;
+
+	function sym(name: string, kind: number) {
+		return { name, kind };
+	}
+
+	it('returns the single exact-name + type-kind match', () => {
+		const symbols = [sym('Result', Interface), sym('ResultHelper', Function)];
+		const result = selectWorkspaceSymbolMatch(symbols, 'Result');
+		expect(result).toEqual({ kind: 'single', index: 0 });
+	});
+
+	it('flags ambiguity when multiple symbols share the name AND a type-kind', () => {
+		const symbols = [sym('Result', Class), sym('Result', Interface), sym('ResultOther', Variable)];
+		const result = selectWorkspaceSymbolMatch(symbols, 'Result');
+		expect(result).toEqual({ kind: 'multiple', indices: [0, 1] });
+	});
+
+	it('falls back to exact-name match when no type-kind match exists', () => {
+		const symbols = [sym('Result', Variable), sym('ResultOther', Class)];
+		const result = selectWorkspaceSymbolMatch(symbols, 'Result');
+		expect(result).toEqual({ kind: 'single', index: 0 });
+	});
+
+	it('flags ambiguity when multiple exact-name matches exist with no type kinds', () => {
+		const symbols = [sym('Result', Variable), sym('Result', Function)];
+		const result = selectWorkspaceSymbolMatch(symbols, 'Result');
+		expect(result).toEqual({ kind: 'multiple', indices: [0, 1] });
+	});
+
+	it('falls back to the first symbol when no exact name match exists', () => {
+		const symbols = [sym('ResultOther', Class), sym('AnotherResult', Interface)];
+		const result = selectWorkspaceSymbolMatch(symbols, 'Result');
+		expect(result).toEqual({ kind: 'single', index: 0 });
+	});
+
+	it('returns null for an empty symbol list', () => {
+		expect(selectWorkspaceSymbolMatch([], 'Result')).toBeNull();
 	});
 });
 

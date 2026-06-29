@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { extractTypeNames, findTypeNameInLines } from './typeExtraction';
+import { extractTypeNames, findTypeNameInLines, selectWorkspaceSymbolMatch } from './typeExtraction';
 
 const LANGUAGES = [
 	{ language: 'typescript' },
@@ -11,8 +11,9 @@ const LANGUAGES = [
 const COMMAND_ID = 'tsClickableTypes.goToTypeDefinition';
 
 // Blocks recursion when our hover provider triggers `executeHoverProvider`,
-// which would otherwise call us again for the same position.
-let providingDepth = 0;
+// which would otherwise call us again for the same position. Keyed per
+// document+position so concurrent hovers in different editors don't interfere.
+const activeRequests = new Set<string>();
 
 let outputChannel: vscode.OutputChannel | undefined;
 
@@ -43,7 +44,7 @@ export function activate(context: vscode.ExtensionContext) {
 
 export function deactivate() {
 	outputChannel = undefined;
-	providingDepth = 0;
+	activeRequests.clear();
 	userExclusions = new Set();
 }
 
@@ -55,11 +56,12 @@ async function provideHover(
 	position: vscode.Position,
 	token: vscode.CancellationToken,
 ): Promise<vscode.Hover | undefined> {
-	if (providingDepth > 0) {
+	const requestKey = `${document.uri.toString()}#${position.line}:${position.character}`;
+	if (activeRequests.has(requestKey)) {
 		return undefined;
 	}
 
-	providingDepth++;
+	activeRequests.add(requestKey);
 	try {
 		const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
 			'vscode.executeHoverProvider',
@@ -112,7 +114,7 @@ async function provideHover(
 
 		return new vscode.Hover(linksRow);
 	} finally {
-		providingDepth--;
+		activeRequests.delete(requestKey);
 	}
 }
 
@@ -172,11 +174,13 @@ async function tryTypeDefinitionProvider(
 
 		if (locations && locations.length > 0) {
 			const loc = locations[0];
-			const targetUri = 'targetUri' in loc ? loc.targetUri : loc.uri;
-			const targetRange =
-				'targetUri' in loc
-					? loc.targetSelectionRange ?? loc.targetRange
-					: loc.range;
+			// `targetRange` exists on LocationLink only; using it as the discriminator
+			// is more reliable than `targetUri` (which collides with similarly-named ad-hoc objects).
+			const isLink = 'targetRange' in loc;
+			const targetUri = isLink ? loc.targetUri : loc.uri;
+			const targetRange = isLink
+				? loc.targetSelectionRange ?? loc.targetRange
+				: loc.range;
 			await vscode.window.showTextDocument(targetUri, {
 				selection: targetRange,
 				preview: false,
@@ -195,30 +199,48 @@ async function tryWorkspaceSymbolSearch(typeName: string): Promise<boolean> {
 			vscode.SymbolInformation[]
 		>('vscode.executeWorkspaceSymbolProvider', typeName);
 
-		if (symbols && symbols.length > 0) {
-			const typeKinds = new Set([
-				vscode.SymbolKind.Interface,
-				vscode.SymbolKind.Class,
-				vscode.SymbolKind.Enum,
-				vscode.SymbolKind.TypeParameter,
-				vscode.SymbolKind.Struct,
-			]);
+		const match = selectWorkspaceSymbolMatch(symbols ?? [], typeName);
+		if (!match) {
+			return false;
+		}
 
-			const best =
-				symbols.find((s) => s.name === typeName && typeKinds.has(s.kind)) ??
-				symbols.find((s) => s.name === typeName) ??
-				symbols[0];
+		const chosen =
+			match.kind === 'single'
+				? symbols[match.index]
+				: await promptForSymbol(match.indices.map((i) => symbols[i]), typeName);
 
-			await vscode.window.showTextDocument(best.location.uri, {
-				selection: best.location.range,
-				preview: false,
-			});
+		if (!chosen) {
+			// User cancelled the picker — still counts as handled.
 			return true;
 		}
+
+		await vscode.window.showTextDocument(chosen.location.uri, {
+			selection: chosen.location.range,
+			preview: false,
+		});
+		return true;
 	} catch (err) {
 		outputChannel?.appendLine(`[tryWorkspaceSymbolSearch] ${err}`);
 	}
 	return false;
+}
+
+async function promptForSymbol(
+	candidates: vscode.SymbolInformation[],
+	typeName: string,
+): Promise<vscode.SymbolInformation | undefined> {
+	const items = candidates.map((sym) => ({
+		label: sym.name,
+		description: vscode.SymbolKind[sym.kind],
+		detail: vscode.workspace.asRelativePath(sym.location.uri),
+		symbol: sym,
+	}));
+	const picked = await vscode.window.showQuickPick(items, {
+		placeHolder: `Multiple definitions for "${typeName}" — pick one`,
+		matchOnDescription: true,
+		matchOnDetail: true,
+	});
+	return picked?.symbol;
 }
 
 // ---------------------------------------------------------------------------

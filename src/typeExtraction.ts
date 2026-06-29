@@ -38,13 +38,27 @@ export const BUILTIN_TYPES = new Set([
 	'XMLHttpRequest', 'WebSocket', 'EventSource',
 	'Performance', 'PerformanceObserver',
 	'Proxy', 'Reflect', 'JSON', 'Math', 'Intl',
-	// React namespace
+	// React namespace & common React types
+	// (FC, SFC, VFC, JSX are all-caps and excluded automatically by the
+	//  lowercase-letter requirement in PASCAL_CASE — no need to list them.)
 	'React',
+	'ReactNode', 'ReactElement', 'ReactChild', 'ReactChildren', 'ReactFragment', 'ReactPortal',
+	'ComponentType', 'ComponentProps', 'ComponentClass', 'FunctionComponent',
+	'PropsWithChildren', 'PropsWithRef', 'PropsWithoutRef',
+	'CSSProperties', 'RefObject', 'MutableRefObject', 'Ref', 'ForwardedRef',
+	'Dispatch', 'SetStateAction',
+	// Node.js
+	'Buffer', 'NodeJS', 'Process', 'IArguments',
+	// TS utility & global types
+	'NoInfer', 'CallableFunction', 'NewableFunction',
 ]);
 
 // ---------------------------------------------------------------------------
 // Module-scoped regex constants — hoisted to avoid per-call recompilation.
 // All use the `g` flag; callers must reset lastIndex = 0 before each use.
+//
+// IMPORTANT: extractTypeNames must remain fully synchronous. The shared regex
+// state (lastIndex) would corrupt if two calls interleaved across an `await`.
 // ---------------------------------------------------------------------------
 
 // Excludes the declared symbol name (e.g. "X" from "type X = ..." or "const X: ...").
@@ -59,6 +73,8 @@ const INLINE_CODE = /`([^`\n]+)`/g;
 
 // Matches PascalCase identifiers — requires at least one lowercase letter to
 // exclude ALL_CAPS constants (e.g. MAX_RETRY, API_KEY) which are not types.
+// Single-letter generic parameters (T, K, V) intentionally do NOT match;
+// they're context-bound and rarely useful as navigation targets.
 const PASCAL_CASE = /\b([A-Z][A-Za-z0-9_]*[a-z][A-Za-z0-9_]*)\b/g;
 
 // ---------------------------------------------------------------------------
@@ -70,26 +86,34 @@ export function extractTypeNames(
 ): string[] {
 	const found = new Set<string>();
 
-	// Exclude the declared symbol name (e.g. "X" from "const X: ...")
-	// since it's the variable/function name, not a type reference.
-	const symbolNames = new Set<string>();
-	SYMBOL_PATTERN.lastIndex = 0;
-	let s: RegExpExecArray | null;
-	while ((s = SYMBOL_PATTERN.exec(hoverText)) !== null) {
-		symbolNames.add(s[1]);
-	}
+	// Collect code block contents first so SYMBOL_PATTERN only scans actual
+	// code — prose like "you can use type X" must not exclude X.
+	const codeBlocks: string[] = [];
 
-	// Scan fenced code blocks
 	FENCED_BLOCK.lastIndex = 0;
 	let m: RegExpExecArray | null;
 	while ((m = FENCED_BLOCK.exec(hoverText)) !== null) {
-		scanForPascalCaseTypes(m[1], found, symbolNames, additionalExclusions);
+		codeBlocks.push(m[1]);
 	}
 
-	// Scan inline code spans
 	INLINE_CODE.lastIndex = 0;
 	while ((m = INLINE_CODE.exec(hoverText)) !== null) {
-		scanForPascalCaseTypes(m[1], found, symbolNames, additionalExclusions);
+		codeBlocks.push(m[1]);
+	}
+
+	// Exclude the declared symbol name (e.g. "X" from "const X: ...")
+	// since it's the variable/function name, not a type reference.
+	const symbolNames = new Set<string>();
+	for (const code of codeBlocks) {
+		SYMBOL_PATTERN.lastIndex = 0;
+		let s: RegExpExecArray | null;
+		while ((s = SYMBOL_PATTERN.exec(code)) !== null) {
+			symbolNames.add(s[1]);
+		}
+	}
+
+	for (const code of codeBlocks) {
+		scanForPascalCaseTypes(code, found, symbolNames, additionalExclusions);
 	}
 
 	return Array.from(found);
@@ -109,6 +133,62 @@ export function scanForPascalCaseTypes(
 			found.add(name);
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Workspace symbol disambiguation
+// ---------------------------------------------------------------------------
+
+// vscode.SymbolKind values for things that are actually types. Duplicated here
+// (rather than imported) so this module stays vscode-free and unit-testable.
+// Numbers match the vscode.SymbolKind enum: Class=4, Interface=10, Enum=9,
+// TypeParameter=25, Struct=22.
+const TYPE_SYMBOL_KINDS: ReadonlySet<number> = new Set([4, 9, 10, 22, 25]);
+
+export type SymbolMatchResult =
+	| { kind: 'single'; index: number }
+	| { kind: 'multiple'; indices: number[] };
+
+/**
+ * Chooses the best match for a typed workspace-symbol lookup.
+ * - Prefers exact-name matches whose SymbolKind is a type (class/interface/enum/…)
+ * - Falls back to any exact-name match
+ * - Falls back to the first symbol
+ * Returns 'multiple' when several equally-good candidates exist so the caller
+ * can prompt the user instead of guessing.
+ */
+export function selectWorkspaceSymbolMatch(
+	symbols: ReadonlyArray<{ name: string; kind: number }>,
+	typeName: string,
+): SymbolMatchResult | null {
+	if (symbols.length === 0) {
+		return null;
+	}
+
+	const typedNameMatches: number[] = [];
+	const nameMatches: number[] = [];
+	for (let i = 0; i < symbols.length; i++) {
+		if (symbols[i].name === typeName) {
+			nameMatches.push(i);
+			if (TYPE_SYMBOL_KINDS.has(symbols[i].kind)) {
+				typedNameMatches.push(i);
+			}
+		}
+	}
+
+	if (typedNameMatches.length === 1) {
+		return { kind: 'single', index: typedNameMatches[0] };
+	}
+	if (typedNameMatches.length > 1) {
+		return { kind: 'multiple', indices: typedNameMatches };
+	}
+	if (nameMatches.length === 1) {
+		return { kind: 'single', index: nameMatches[0] };
+	}
+	if (nameMatches.length > 1) {
+		return { kind: 'multiple', indices: nameMatches };
+	}
+	return { kind: 'single', index: 0 };
 }
 
 export function escapeRegExp(str: string): string {
@@ -141,6 +221,10 @@ export function findTypeNameInLines(
 	typeName: string,
 	searchRange = 5,
 ): LinePosition | null {
+	if (totalLines === 0) {
+		return null;
+	}
+
 	const regex = new RegExp(`\\b${escapeRegExp(typeName)}\\b`, 'g');
 	const startLine = Math.max(0, hoverLine - searchRange);
 	const endLine = Math.min(totalLines - 1, hoverLine + searchRange);
@@ -162,15 +246,18 @@ export function findTypeNameInLines(
 		return bestMatch;
 	}
 
-	// Fall back to surrounding lines
-	for (let line = startLine; line <= endLine; line++) {
-		if (line === hoverLine) {
-			continue;
-		}
-		regex.lastIndex = 0;
-		const match = regex.exec(readLine(line));
-		if (match) {
-			return { line, character: match.index };
+	// Fall back to surrounding lines, ordered by distance from hover line so
+	// the closest match wins (tie-breaker: line above, then line below).
+	for (let offset = 1; offset <= searchRange; offset++) {
+		for (const line of [hoverLine - offset, hoverLine + offset]) {
+			if (line < startLine || line > endLine) {
+				continue;
+			}
+			regex.lastIndex = 0;
+			const match = regex.exec(readLine(line));
+			if (match) {
+				return { line, character: match.index };
+			}
 		}
 	}
 
