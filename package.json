@@ -2,7 +2,7 @@
 	"name": "ts-clickable-types",
 	"displayName": "TypeScript Clickable Types",
 	"description": "Adds clickable type-name links to hover tooltips — jump to any type definition like in Visual Studio.",
-	"version": "1.2.4",
+	"version": "1.2.5",
 	"publisher": "profanterdev",
 	"repository": {
 		"type": "git",
