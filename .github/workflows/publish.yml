@@ -25,8 +25,11 @@ jobs:
       - name: Package extension
         run: npx vsce package
 
-      - name: Publish to Marketplace
-        run: npx vsce publish --pat ${{ secrets.VSCE_PAT }}
+      - name: Publish to VS Code Marketplace
+        run: npx vsce publish --pat ${{ secrets.VSCE_PAT }} --packagePath *.vsix
+
+      - name: Publish to Open VSX
+        run: npx ovsx publish --pat ${{ secrets.OVSX_PAT }} *.vsix
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
