@@ -80,8 +80,8 @@
 		"@types/node": "^20.19.43",
 		"@types/vscode": "^1.74.0",
 		"@vscode/vsce": "^3.9.2",
-		"esbuild": "^0.28.1",
-		"typescript": "^5.9.3",
+		"esbuild": "^0.28.2",
+		"typescript": "^7.0.2",
 		"vitest": "^4.1.10"
 	}
 }
